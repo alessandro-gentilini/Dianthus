@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 2.8)
+PROJECT( dianthus )
+FIND_PACKAGE( OpenCV REQUIRED )
+ADD_EXECUTABLE( dianthus dianthus.cpp )
+TARGET_LINK_LIBRARIES( dianthus ${OpenCV_LIBS} )
+SET(CMAKE_CXX_FLAGS "-std=c++0x")
