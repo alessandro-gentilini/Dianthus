@@ -1,3 +1,5 @@
+#define _USE_MATH_DEFINES 
+
 #include "opencv2/imgproc/imgproc.hpp"
 #include "opencv2/highgui/highgui.hpp"
 #include <opencv2/ml/ml.hpp>
@@ -10,14 +12,90 @@
 #include <functional>
 #include <set>
 
-
-
 cv::Point2f centroid( const std::vector< cv::Point2f >& p )
 {
    cv::Point2f r( std::accumulate( p.begin(), p.end(), cv::Point2f(0,0) ) );
    r.x /= p.size();
    r.y /= p.size();
    return r;
+}
+
+cv::Mat point_to_homogeneous( const cv::Point2f& p )
+{
+   float v[]={p.x, p.y, 1};
+   return cv::Mat(3,1,CV_32FC1,v).clone();
+}
+
+cv::Point2f homogeneous_to_point( const cv::Mat& m )
+{
+   cv::Mat r = m/m.at<float>(2,0);
+   return cv::Point2f(r.at<float>(0,0),r.at<float>(1,0));
+}
+
+std::vector< cv::Point2f > affine_transformation( const std::vector< cv::Point2f >& p, float m11, float m12, float m13, float m21, float m22, float m23 )
+{
+   float to_origin_raw[]={1, 0, -centroid(p).x,
+                          0, 1, -centroid(p).y,
+                          0, 0,                   1};
+   cv::Mat to_origin(3,3,CV_32FC1,to_origin_raw);
+   std::vector< cv::Point2f > dst( p.size() );
+   for ( size_t i = 0; i < p.size(); i++ ) {
+      cv::Mat tmp1 = point_to_homogeneous(p[i]);
+      cv::Mat tmp = to_origin*tmp1;
+      dst[i] = homogeneous_to_point(tmp);
+   }
+
+   float shear_raw[]={m11, m12, m13,
+                      m21, m22, m23,
+                        0,   0,   1};
+
+   cv::Mat shear(3,3,CV_32FC1,shear_raw);
+   for ( size_t i = 0; i < dst.size(); i++ ) {
+      cv::Mat tmp1 = point_to_homogeneous(dst[i]);
+      cv::Mat tmp = shear*tmp1;
+      dst[i] = homogeneous_to_point(tmp);
+   }
+
+   float to_centroid_raw[]={1, 0, centroid(p).x,
+                          0, 1, centroid(p).y,
+                          0, 0,                  1};
+   cv::Mat to_centroid(3,3,CV_32FC1,to_centroid_raw);
+   for ( size_t i = 0; i < dst.size(); i++ ) {
+      cv::Mat tmp1 = point_to_homogeneous(dst[i]);
+      cv::Mat tmp = to_centroid*tmp1;
+      dst[i] = homogeneous_to_point(tmp);
+   }
+
+   return dst;
+}
+
+void save_point_set( const char* name, int rows, int cols, const std::vector< cv::Point2f >& p )
+{
+   cv::Mat img = cv::Mat::zeros( rows, cols, CV_8UC3 );
+   for ( size_t i = 0; i < p.size(); i++ ) {
+      img.at<cv::Vec3b>(p[i]) = cv::Vec3b(255,255,255);
+   }
+   cv::imwrite(name,img);
+}
+
+float oriented_hausdorff_distance( const std::vector< cv::Point2f >& A, const std::vector< cv::Point2f >& B )
+{
+   float result = 0;
+   for ( size_t i = 0; i < A.size(); i++ ) {
+      float min_dist = std::numeric_limits<float>::max();
+      for ( size_t j = 0; j < B.size(); j++ ) {
+         const float dx = A[i].x-B[j].x;
+         const float dy = A[i].y-B[j].y;
+         min_dist = std::min( min_dist, dx*dx+dy*dy );
+      }
+      result = std::max( result, min_dist );
+   }
+   return std::sqrt(result);
+}
+
+float hausdorff_distance( const std::vector< cv::Point2f >& A, const std::vector< cv::Point2f >& B )
+{
+   return std::max( oriented_hausdorff_distance( A, B ), oriented_hausdorff_distance( B, A ) );
 }
 
 // http://stackoverflow.com/a/21735828/15485
@@ -325,6 +403,47 @@ int main(int argc,char** argv)
    getOrientation( v, nv );
    float result = SVM.predict( cv::Mat(1,nv.size()*2, CV_32FC1, &nv[0]), false );
    std::cout << c << "\t" << characters[result] << "\n";
+   }
+
+   std::default_random_engine dre3;
+   std::normal_distribution<float> nd3(0,.15);
+   auto gauss3 = std::bind(nd3, dre3);
+
+   std::map< char, std::vector< cv::Point2f > > normalized_models( models );
+   for ( auto it = normalized_models.begin(); it != normalized_models.end(); ++it ) {
+      getOrientation( models[it->first], it->second );
+   }
+
+   std::cout << "Wrong Hausdorff Predictions:\n";
+   std::cout << "query\tresult\n";
+   for ( size_t n = 0; n < 100; n++ ) {
+      for ( size_t i = 0; i < characters.length(); i++ ) {
+         const char q = characters[i];
+         std::vector< cv::Point2f > query = generate_sample(q,models,gauss3);
+         float theta = (1*M_PI)/180;
+         query = affine_transformation( query, cos(theta), sin(theta), 0, -sin(theta), cos(theta), 0 );
+         std::vector< cv::Point2f > normalized_query;
+         getOrientation( query, normalized_query );
+         float distance = std::numeric_limits<float>::max();
+         char found = 0;
+         for ( auto it = normalized_models.begin(); it != normalized_models.end(); ++it ) {
+            const float d = hausdorff_distance( normalized_query, it->second );
+            if ( d < distance ) {
+               distance = d;
+               found = it->first;
+            }
+         }
+         if ( q != found ) {
+            std::cout << n << "\t" << q << "\t" << found << "\n";
+            std::ostringstream oss1;
+            oss1 << n << "_" << q << "_wrong_query.png";
+            save_point_set( oss1.str().c_str(), ground_truth.rows, ground_truth.cols, query );
+
+            std::ostringstream oss2;
+            oss2 << n << "_" << q << "_wrong_result.png";
+            save_point_set( oss2.str().c_str(), ground_truth.rows, ground_truth.cols, models[found] );
+         }
+      }
    }
 
    cv::waitKey(0);
